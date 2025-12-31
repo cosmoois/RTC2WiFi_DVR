@@ -1,27 +1,21 @@
 #include <Wire.h>
 #include "RTClib.h"
+#include <time.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiClient.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <Preferences.h>
-#include "esp_system.h"
 
-const char* ssid     = "ドラレコのSSID";
-const char* password = "ドラレコのパスワード";
-// const char *ssid = "自宅ルータ";   /* テスト用 */
-// const char *password = "ルータパスワード";
+const char* dvr_ssid     = "ドラレコのSSID";
+const char* dvr_password = "ドラレコのパスワード";
+const char *ntp_ssid = "自宅ルータ";
+const char *ntp_password = "ルータパスワード";
 
-Preferences preferences;
-
-#define NVS_NAMESPACE "boot"
-#define KEY_BUILD_ID  "build"
-
-// RTCメモリ（電源OFFで消える）
-RTC_DATA_ATTR bool alreadyExecuted = false;
-const char* BUILD_ID = __DATE__ " " __TIME__;
-
+const char* ntpServer = "ntp.nict.jp";
+const long  gmtOffset_sec = 9 * 3600;   // JST
+const int   daylightOffset_sec = 0;
+bool rtc_setup = false;
 RTC_DS1307 rtc;
 
 // OLED 設定（128x32）
@@ -34,14 +28,19 @@ const int VCC_PIN = 8;
 const int SDA_PIN = 7;
 const int SCL_PIN = 6;
 const int BAT_ADC_PIN = 4;  // BAT 電圧測定用（GPIO5はADC2なのでWiFi使用時は使えないためGPIO4に変更）
+const int SW_PIN = 0;
 
-void setSystemTimeFromRTC();
-bool syncTimeToDVR();
+bool syncTimeToDDPai();
+void WifiConnect(const char *ssid, const char *password);
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);  // 書き込み時にRTCに時刻を書き込むためリセット起動が安定するまで待つ時間
+  pinMode(SW_PIN, INPUT_PULLUP);
 
+  // SWが押されていなければ何もしない
+  if (digitalRead(SW_PIN) == LOW) {
+    rtc_setup = true;
+  }
   // I2Cデバイス 電源ON
   pinMode(GND_PIN, OUTPUT);
   gpio_set_drive_capability((gpio_num_t)GND_PIN, GPIO_DRIVE_CAP_3);
@@ -58,58 +57,59 @@ void setup() {
     while (1);
   }
   display.clearDisplay();
+  display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
 
   // --- RTC 初期化 ---
   if (!rtc.begin()) {
-    Serial.println("RTC not found!");
+    display.println("RTC not found!");
+    display.display();
     while (1);
   }
-
-  preferences.begin(NVS_NAMESPACE, false);
-  String savedBuild = preferences.getString(KEY_BUILD_ID, "default");
-
-  Serial.println(savedBuild);
-  Serial.println(BUILD_ID);
-
-  if (!alreadyExecuted && savedBuild != BUILD_ID) {
-
-    // 先にマーク（USB CDCによる多重リセット対策）
-    alreadyExecuted = true;
-
-    DateTime buildTime(__DATE__, __TIME__);
-    DateTime setTime = buildTime + TimeSpan(20);  // 書き込むまでの時間の遅れを補正（平均的にビルド時刻から20秒遅れるため進める）
-
-    // RTCに時刻を書き込む
-    rtc.adjust(setTime);
-
-    // 今回のビルドIDを保存
-    preferences.putString(KEY_BUILD_ID, BUILD_ID);
-    Serial.println("Write the time to the RTC.");
-  }else{
-    Serial.println("Use RTC value.");
-  }
-
-  preferences.end();
-
-  setSystemTimeFromRTC();
 
   analogReadResolution(12);       // 0–4095
   analogSetAttenuation(ADC_11db); // 最大3.3V
 
-  // ドラレコに接続
-  display.clearDisplay();
-  display.setTextSize(1);
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    display.print(".");
-    display.display();
+  // WiFi接続
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+  WiFi.mode(WIFI_STA);
+  delay(100);
+
+  if ( rtc_setup == true ) {
+    // NTP に接続
+    WifiConnect(ntp_ssid, ntp_password);
+
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) {
+      WiFi.disconnect(true);
+      return;
+    }
+
+    // RTCへ書き込み
+    rtc.adjust(DateTime(
+      timeinfo.tm_year + 1900,
+      timeinfo.tm_mon + 1,
+      timeinfo.tm_mday,
+      timeinfo.tm_hour,
+      timeinfo.tm_min,
+      timeinfo.tm_sec
+    ));
+  } else {
+    // Mini2 AP に接続
+    WifiConnect(dvr_ssid, dvr_password);
+
+    if (!syncTimeToDDPai()) {
+      while (1);
+    }
   }
 
-  if (!syncTimeToDVR()) {
-    while (1);
-  }
+  // WiFi切断
+  WiFi.disconnect(true, false);
+  delay(100);
+  WiFi.mode(WIFI_OFF);
+  delay(100);
 }
 
 void loop() {
@@ -127,38 +127,28 @@ void loop() {
   display.setCursor(0, 0);
   display.printf("%02d:%02d:%02d", now.hour(), now.minute(), now.second()); // 時刻
 
-  display.setCursor(0, 24);
-  display.setTextSize(1);
-  display.printf("%04d/%02d/%02d", now.year(), now.month(), now.day()); // 日付
-  display.printf("  %.2f V", voltage); // 電圧
+  display.setCursor(0, 16);
+  display.setTextSize(2);
+  display.printf("%02d/%02d", now.month(), now.day()); // 日付
+  display.printf(" %.2f", voltage); // 電圧
 
   display.display();
 
   delay(300);
 }
 
-void setSystemTimeFromRTC() {
-  DateTime now = rtc.now();
-
-  struct tm tm;
-  tm.tm_year = now.year() - 1900;
-  tm.tm_mon  = now.month() - 1;
-  tm.tm_mday = now.day();
-  tm.tm_hour = now.hour();
-  tm.tm_min  = now.minute();
-  tm.tm_sec  = now.second();
-  tm.tm_isdst = -1;
-
-  time_t t = mktime(&tm);
-
-  struct timeval tv;
-  tv.tv_sec = t;
-  tv.tv_usec = 0;
-
-  settimeofday(&tv, NULL);
+void WifiConnect(const char *ssid, const char *password) {
+  display.println(ssid);
+  display.display();
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    display.print(".");
+    display.display();
+  }
 }
 
-bool syncTimeToDVR() {
+bool syncTimeToDDPai() {
   WiFiClient client;
 
   if (!client.connect("193.168.0.1", 80)) {
@@ -168,13 +158,13 @@ bool syncTimeToDVR() {
     return false;
   }
 
-  // ESP32 の RTC から現在時刻取得（例）
-  struct tm timeinfo;
-  getLocalTime(&timeinfo);
-
   // YYYYMMDDhhmmss を生成
+  DateTime now = rtc.now();
+
   char dateStr[15];
-  strftime(dateStr, sizeof(dateStr), "%Y%m%d%H%M%S", &timeinfo);
+  snprintf(dateStr, sizeof(dateStr), "%04d%02d%02d%02d%02d%02d",
+           now.year(), now.month(), now.day(),
+           now.hour(), now.minute(), now.second());
 
   // ms はとりあえず 0 にする
   int ms = millis() % 1000;
